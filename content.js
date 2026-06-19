@@ -109,6 +109,45 @@
     }
   }
 
+  // Balanced slice starting exactly at an opening brace/bracket.
+  function sliceBalanced(text, start) {
+    const open = text[start];
+    const close = open === "{" ? "}" : "]";
+    let depth = 0, inStr = false, esc = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') inStr = true;
+      else if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return null;
+  }
+
+  // Parse a top-level `var X = {…}` assignment from the page HTML. Anchoring on
+  // the assignment (not the first mention of the name) avoids grabbing an
+  // unrelated/garbled object.
+  function extractAssigned(html, name) {
+    const re = new RegExp("(?:var\\s+|window(?:\\[[\"']|\\.)\\s*)?" + name + "(?:[\"']\\])?\\s*=\\s*");
+    const m = re.exec(html);
+    if (!m) return null;
+    const brace = html.indexOf("{", m.index + m[0].length - 1);
+    if (brace === -1) return null;
+    const json = sliceBalanced(html, brace);
+    if (!json) return null;
+    try {
+      return JSON.parse(json);
+    } catch (_) {
+      return null;
+    }
+  }
+
   function deepCollect(obj, key, out) {
     if (!obj || typeof obj !== "object") return out;
     if (Array.isArray(obj)) {
@@ -215,10 +254,14 @@
   // Strategy B: YouTube's get_transcript InnerTube API (default language).
   async function fetchViaGetTranscript(videoId, html) {
     if (!html) html = await fetchWatchHtml(videoId);
-    const initialData = parseJsonAfter(html, "ytInitialData", "{", "}");
+    const initialData = extractAssigned(html, "ytInitialData");
     const endpoints = initialData ? deepCollect(initialData, "getTranscriptEndpoint", []) : [];
-    const params = endpoints.find((e) => e && e.params) && endpoints.find((e) => e && e.params).params;
-    if (!params) return [];
+    const withParams = endpoints.find((e) => e && e.params);
+    const params = withParams && withParams.params;
+    if (!params) {
+      log("get_transcript: no params in ytInitialData");
+      return [];
+    }
     const apiKey = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
     const context = parseJsonAfter(html, '"INNERTUBE_CONTEXT":', "{", "}");
     if (!apiKey || !context) return [];
@@ -260,34 +303,74 @@
     return out;
   }
 
+  const TRANSCRIPT_PANEL_SEL =
+    'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]';
+
+  function findTranscriptButton() {
+    return (
+      document.querySelector(
+        'ytd-video-description-transcript-section-renderer button, button[aria-label*="transcript" i]'
+      ) ||
+      [...document.querySelectorAll("ytd-button-renderer, tp-yt-paper-button, button")].find((c) =>
+        ["show transcript", "transcript"].includes((c.textContent || "").trim().toLowerCase())
+      ) ||
+      null
+    );
+  }
+
+  function closeTranscriptPanel() {
+    const panel = document.querySelector(TRANSCRIPT_PANEL_SEL);
+    if (!panel) return;
+    const close = panel.querySelector(
+      'button[aria-label="Close" i], ytd-engagement-panel-title-header-renderer button, yt-icon-button#visibility-button button'
+    );
+    if (close) close.click();
+  }
+
   async function scrapeTranscriptFromPanel(videoId) {
     if (getVideoId() !== videoId) return [];
     let segs = readRenderedSegments();
-    if (segs.length) return segs;
-
-    const expand = document.querySelector("#description #expand, tp-yt-paper-button#expand");
-    if (expand) { expand.click(); await sleep(350); }
-
-    const btn =
-      document.querySelector('ytd-video-description-transcript-section-renderer button, button[aria-label*="transcript" i]') ||
-      [...document.querySelectorAll("ytd-button-renderer, tp-yt-paper-button, button")].find((c) =>
-        ["show transcript", "transcript"].includes((c.textContent || "").trim().toLowerCase())
-      );
-    if (!btn) return [];
-    btn.click();
-
-    for (let i = 0; i < 24 && !segs.length; i++) {
-      await sleep(250);
-      segs = readRenderedSegments();
-    }
     if (segs.length) {
-      const panel = document.querySelector(
-        'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]'
-      );
-      const close = panel && panel.querySelector('button[aria-label="Close" i], ytd-engagement-panel-title-header-renderer button');
-      if (close) close.click();
+      closeTranscriptPanel();
+      return segs;
     }
-    return segs;
+
+    // Keep YouTube's own transcript panel invisible while we read it, so the
+    // user never sees a competing black panel.
+    const style = document.createElement("style");
+    style.textContent = `${TRANSCRIPT_PANEL_SEL}{opacity:0!important;pointer-events:none!important;position:fixed!important;left:-99999px!important;top:0!important;}`;
+    document.documentElement.appendChild(style);
+
+    try {
+      const expand = document.querySelector("#description #expand, tp-yt-paper-button#expand");
+      if (expand) { expand.click(); await sleep(300); }
+
+      const btn = findTranscriptButton();
+      if (!btn) {
+        log("panel: no Show transcript button");
+        return [];
+      }
+      btn.click();
+
+      // Wait until segments render AND their count stabilizes.
+      let stable = 0;
+      let last = 0;
+      for (let i = 0; i < 50; i++) {
+        await sleep(200);
+        segs = readRenderedSegments();
+        if (segs.length && segs.length === last) {
+          if (++stable >= 2) break;
+        } else {
+          stable = 0;
+        }
+        last = segs.length;
+      }
+      return segs;
+    } finally {
+      // Always tidy up so the native panel can never be left open.
+      closeTranscriptPanel();
+      setTimeout(() => style.remove(), 600);
+    }
   }
 
   async function extract(videoId, preferredLang) {
@@ -300,16 +383,26 @@
     if (!chosen) chosen = pickLanguage(languages);
 
     let segments = [];
-    if (chosen && chosen.baseUrl) {
+    const specificLang = !!(preferredLang && chosen && chosen.code === preferredLang);
+
+    // When the user explicitly picks a language, prefer that track's caption URL.
+    if (specificLang && chosen.baseUrl) {
       segments = await fetchTimedText(chosen.baseUrl);
       if (segments.length) log("extracted via timedtext", chosen.code);
     }
+    // Otherwise prefer get_transcript — the reliable, silent API path.
     if (!segments.length) {
       try {
         segments = await fetchViaGetTranscript(videoId, html);
         if (segments.length) log("extracted via get_transcript");
       } catch (err) { log("get_transcript failed", err); }
     }
+    // Fall back to the chosen track's caption URL.
+    if (!segments.length && chosen && chosen.baseUrl) {
+      segments = await fetchTimedText(chosen.baseUrl);
+      if (segments.length) log("extracted via timedtext fallback", chosen.code);
+    }
+    // Last resort: read (invisibly) from YouTube's own transcript panel.
     if (!segments.length) {
       segments = await scrapeTranscriptFromPanel(videoId);
       if (segments.length) log("extracted via panel scrape");
