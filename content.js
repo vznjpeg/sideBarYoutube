@@ -35,13 +35,19 @@
     return null;
   }
 
-  // Extract the JSON array that follows `key` from a blob of text, matching
-  // brackets while respecting strings. More reliable than a regex because
-  // caption track objects can themselves contain nested arrays.
-  function extractArrayAfter(text, key) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function log(...args) {
+    console.debug("[Transcript Sidebar]", ...args);
+  }
+
+  // Extract a balanced {...} or [...] region starting at the first `open`
+  // character after `key`, respecting strings. More robust than regex because
+  // YouTube's blobs contain deeply nested structures.
+  function extractBalancedAfter(text, key, open, close) {
     const keyIdx = text.indexOf(key);
     if (keyIdx === -1) return null;
-    const start = text.indexOf("[", keyIdx);
+    const start = text.indexOf(open, keyIdx);
     if (start === -1) return null;
     let depth = 0;
     let inStr = false;
@@ -54,9 +60,9 @@
         else if (c === '"') inStr = false;
       } else if (c === '"') {
         inStr = true;
-      } else if (c === "[") {
+      } else if (c === open) {
         depth++;
-      } else if (c === "]") {
+      } else if (c === close) {
         depth--;
         if (depth === 0) return text.slice(start, i + 1);
       }
@@ -64,53 +70,115 @@
     return null;
   }
 
-  function parseCaptionTracks(text) {
-    const arr = extractArrayAfter(text, '"captionTracks"');
-    if (!arr) return [];
+  function parseJsonAfter(text, key, open, close) {
+    const blob = extractBalancedAfter(text, key, open, close);
+    if (!blob) return null;
     try {
-      return JSON.parse(arr);
+      return JSON.parse(blob);
     } catch (_) {
-      return [];
+      return null;
     }
   }
 
-  // The current page already embeds the player response (with valid, session
-  // scoped caption URLs) in an inline <script>. Reading it avoids an extra
-  // network round-trip and the EU consent interstitial. Only trusted when the
-  // page is actually showing the video we want.
-  function readCaptionTracksFromPage(videoId) {
-    if (getVideoId() !== videoId) return [];
-    for (const script of document.scripts) {
-      const t = script.textContent;
-      if (t && t.includes('"captionTracks"') && t.includes(videoId)) {
-        const tracks = parseCaptionTracks(t);
-        if (tracks.length) return tracks;
-      }
+  // Recursively collect every value stored under `key` anywhere in `obj`.
+  function deepCollect(obj, key, out) {
+    if (!obj || typeof obj !== "object") return out;
+    if (Array.isArray(obj)) {
+      for (const item of obj) deepCollect(item, key, out);
+      return out;
     }
-    return [];
+    for (const k of Object.keys(obj)) {
+      if (k === key) out.push(obj[k]);
+      deepCollect(obj[k], key, out);
+    }
+    return out;
   }
 
-  // Fallback: fetch the watch page HTML and parse the caption tracks out of it.
-  async function fetchCaptionTracks(videoId) {
+  const SOURCE_LABELS = {
+    api: "YouTube API",
+    captions: "captions",
+    panel: "transcript panel",
+  };
+
+  function formatSegmentsStatus(source) {
+    return `${segments.length} lines · via ${SOURCE_LABELS[source] || source}`;
+  }
+
+  // ---- Strategy 1: YouTube's get_transcript InnerTube API ------------------
+  // This is the endpoint the on-page "Show transcript" button uses. It returns
+  // the transcript directly, so it isn't affected by the empty-body problem
+  // that now plagues the raw timedtext caption URLs.
+  async function fetchWatchHtml(videoId) {
     const res = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
       credentials: "include",
     });
-    if (!res.ok) {
-      throw new Error(`Failed to load video page (${res.status})`);
-    }
-    return parseCaptionTracks(await res.text());
+    if (!res.ok) throw new Error(`watch page HTTP ${res.status}`);
+    return res.text();
   }
 
-  async function getCaptionTracks(videoId) {
-    const fromPage = readCaptionTracksFromPage(videoId);
-    if (fromPage.length) return fromPage;
-    return fetchCaptionTracks(videoId);
+  function findTranscriptParams(initialData) {
+    // The transcript engagement panel carries a getTranscriptEndpoint with the
+    // continuation params we need to POST to get_transcript.
+    const endpoints = deepCollect(initialData, "getTranscriptEndpoint", []);
+    for (const ep of endpoints) {
+      if (ep && ep.params) return ep.params;
+    }
+    return null;
+  }
+
+  function parseGetTranscript(data) {
+    const renderers = deepCollect(data, "transcriptSegmentRenderer", []);
+    const out = [];
+    for (const r of renderers) {
+      const snippet = r.snippet || {};
+      const raw = snippet.runs
+        ? snippet.runs.map((x) => x.text || "").join("")
+        : snippet.simpleText || "";
+      const text = raw.replace(/\s+/g, " ").trim();
+      if (!text) continue;
+      const startMs = parseInt(r.startMs || "0", 10);
+      const endMs = parseInt(r.endMs || "0", 10);
+      out.push({ start: startMs / 1000, dur: (endMs - startMs) / 1000, text });
+    }
+    return out;
+  }
+
+  async function fetchViaGetTranscript(videoId, html) {
+    if (!html) html = await fetchWatchHtml(videoId);
+    const initialData = parseJsonAfter(html, "ytInitialData", "{", "}");
+    const params = initialData && findTranscriptParams(initialData);
+    if (!params) {
+      log("get_transcript: no transcript params (video may have no captions)");
+      return [];
+    }
+    const apiKey = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
+    const context = parseJsonAfter(html, '"INNERTUBE_CONTEXT":', "{", "}");
+    if (!apiKey || !context) {
+      log("get_transcript: missing API key or context");
+      return [];
+    }
+    const res = await fetch(
+      `https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`,
+      {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ context, params }),
+      }
+    );
+    if (!res.ok) throw new Error(`get_transcript HTTP ${res.status}`);
+    return parseGetTranscript(await res.json());
+  }
+
+  // ---- Strategy 2: legacy timedtext caption URLs ---------------------------
+  function decodeEntities(str) {
+    const ta = document.createElement("textarea");
+    ta.innerHTML = str;
+    return ta.value;
   }
 
   function pickTrack(tracks) {
     if (!tracks.length) return null;
-    // Prefer a manually-created English track, then any English, then any
-    // manual track, then anything at all.
     const isEnglish = (t) => (t.languageCode || "").toLowerCase().startsWith("en");
     return (
       tracks.find((t) => isEnglish(t) && t.kind !== "asr") ||
@@ -118,12 +186,6 @@
       tracks.find((t) => t.kind !== "asr") ||
       tracks[0]
     );
-  }
-
-  function decodeEntities(str) {
-    const ta = document.createElement("textarea");
-    ta.innerHTML = str;
-    return ta.value;
   }
 
   function parseJson3(data) {
@@ -162,63 +224,143 @@
     return out;
   }
 
-  async function fetchCaptionBody(url) {
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) throw new Error(`captions HTTP ${res.status}`);
-    return (await res.text()).trim();
-  }
-
-  // YouTube intermittently returns an empty body for a given caption format,
-  // so try json3 first and fall back to the default XML format.
-  async function fetchSegments(track) {
-    const base = track.baseURL;
+  async function fetchViaTimedText(videoId, html) {
+    if (!html) html = await fetchWatchHtml(videoId);
+    const tracks = parseJsonAfter(html, '"captionTracks"', "[", "]") || [];
+    const track = pickTrack(tracks);
+    if (!track || !track.baseURL) return [];
 
     try {
-      const body = await fetchCaptionBody(base + "&fmt=json3");
+      const res = await fetch(track.baseURL + "&fmt=json3", { credentials: "include" });
+      const body = (await res.text()).trim();
       if (body) {
         const segs = parseJson3(JSON.parse(body));
         if (segs.length) return segs;
       }
     } catch (err) {
-      console.debug("YouTube Transcript Sidebar: json3 failed", err);
+      log("timedtext json3 failed", err);
     }
 
-    const xml = await fetchCaptionBody(base);
-    if (xml) {
-      const segs = parseXmlCaptions(xml);
-      if (segs.length) return segs;
-    }
-
-    throw new Error("captions returned no usable text");
+    const res = await fetch(track.baseURL, { credentials: "include" });
+    const xml = (await res.text()).trim();
+    return xml ? parseXmlCaptions(xml) : [];
   }
 
+  // ---- Strategy 3: scrape YouTube's own rendered transcript panel ----------
+  // The most resilient path: let YouTube render the transcript with its own
+  // authenticated session, then read it straight out of the DOM.
+  function parseTimestamp(str) {
+    const parts = (str || "").trim().split(":").map(Number);
+    if (!parts.length || parts.some(isNaN)) return 0;
+    return parts.reduce((acc, n) => acc * 60 + n, 0);
+  }
+
+  function readRenderedSegments() {
+    const nodes = document.querySelectorAll("ytd-transcript-segment-renderer");
+    const out = [];
+    nodes.forEach((node) => {
+      const tx = node.querySelector(".segment-text");
+      if (!tx) return;
+      const text = (tx.textContent || "").replace(/\s+/g, " ").trim();
+      if (!text) return;
+      const ts = node.querySelector(".segment-timestamp");
+      out.push({ start: parseTimestamp(ts && ts.textContent), dur: 0, text });
+    });
+    return out;
+  }
+
+  function findTranscriptButton() {
+    const direct = document.querySelector(
+      'ytd-video-description-transcript-section-renderer button, button[aria-label*="transcript" i]'
+    );
+    if (direct) return direct;
+    const candidates = document.querySelectorAll(
+      "ytd-button-renderer, tp-yt-paper-button, button"
+    );
+    for (const c of candidates) {
+      const t = (c.textContent || "").trim().toLowerCase();
+      if (t === "show transcript" || t === "transcript") return c;
+    }
+    return null;
+  }
+
+  function closeTranscriptPanel() {
+    const panel = document.querySelector(
+      'ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-searchable-transcript"]'
+    );
+    if (!panel) return;
+    const close = panel.querySelector(
+      'button[aria-label="Close" i], ytd-engagement-panel-title-header-renderer button'
+    );
+    if (close) close.click();
+  }
+
+  async function scrapeTranscriptFromPanel(videoId) {
+    if (getVideoId() !== videoId) return []; // DOM only reflects current video
+
+    let segs = readRenderedSegments();
+    if (segs.length) return segs;
+
+    // Expand the description so the "Show transcript" button is in the DOM.
+    const expand = document.querySelector("#description #expand, tp-yt-paper-button#expand");
+    if (expand) {
+      expand.click();
+      await sleep(350);
+    }
+
+    const btn = findTranscriptButton();
+    if (!btn) {
+      log("panel: no Show transcript button found");
+      return [];
+    }
+    btn.click();
+
+    // Wait for YouTube to render the segments.
+    for (let i = 0; i < 24 && !segs.length; i++) {
+      await sleep(250);
+      segs = readRenderedSegments();
+    }
+    if (segs.length) closeTranscriptPanel();
+    return segs;
+  }
+
+  // ---- Orchestration -------------------------------------------------------
   async function loadTranscript(videoId) {
     setStatus("Loading transcript…", "loading");
     segments = [];
     renderSegments();
+
+    // Both network strategies parse the same watch page; fetch it once.
+    let html = null;
     try {
-      const tracks = await getCaptionTracks(videoId);
-      if (!tracks.length) {
-        setStatus("No transcript is available for this video.", "empty");
-        return;
-      }
-      const track = pickTrack(tracks);
-      segments = await fetchSegments(track);
-      if (!segments.length) {
-        setStatus("No transcript is available for this video.", "empty");
-        return;
-      }
-      const langName =
-        (track.name && (track.name.simpleText || (track.name.runs && track.name.runs[0] && track.name.runs[0].text))) ||
-        track.languageCode ||
-        "";
-      const auto = track.kind === "asr" ? " · auto-generated" : "";
-      setStatus(`${segments.length} lines · ${langName}${auto}`, "ok");
-      renderSegments();
+      html = await fetchWatchHtml(videoId);
     } catch (err) {
-      console.error("YouTube Transcript Sidebar:", err);
-      setStatus("Couldn't load the transcript. Try reloading the page.", "error");
+      log("watch page fetch failed", err);
     }
+
+    const strategies = [
+      ["api", () => fetchViaGetTranscript(videoId, html)],
+      ["captions", () => fetchViaTimedText(videoId, html)],
+      ["panel", () => scrapeTranscriptFromPanel(videoId)],
+    ];
+
+    for (const [name, run] of strategies) {
+      try {
+        log(`trying strategy: ${name}`);
+        const segs = await run();
+        if (segs && segs.length) {
+          segments = segs;
+          setStatus(formatSegmentsStatus(name), "ok");
+          renderSegments();
+          log(`strategy ${name} succeeded with ${segs.length} lines`);
+          return;
+        }
+      } catch (err) {
+        log(`strategy ${name} failed`, err);
+      }
+    }
+
+    setStatus("No transcript is available for this video.", "empty");
   }
 
   // ---------------------------------------------------------------------------

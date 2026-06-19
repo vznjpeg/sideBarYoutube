@@ -29,11 +29,25 @@ video you're watching and displays it in a clean sidebar — with one-click copy
 
 - Clicking the toolbar icon (handled in `background.js`) sends a toggle message
   to the content script.
-- `content.js` fetches the video's watch page, parses the `captionTracks` list
-  from the embedded player response, and downloads the captions as JSON
-  (`fmt=json3`). All requests are same-origin to `www.youtube.com`.
+- `content.js` loads the transcript using three fallback strategies, in order,
+  stopping at the first that returns text:
+  1. **`get_transcript` API** — the same InnerTube endpoint YouTube's own "Show
+     transcript" button uses. The transcript params and InnerTube context are
+     parsed out of the watch page, then POSTed to
+     `youtubei/v1/get_transcript`.
+  2. **Caption URLs (timedtext)** — parses `captionTracks` from the page and
+     downloads them as `json3`, falling back to XML.
+  3. **DOM scraping** — opens YouTube's own transcript panel and reads the
+     rendered segments straight out of the page. Slower and briefly visible,
+     but works even when the network paths are blocked.
+- All requests are same-origin to `www.youtube.com`.
 - The UI is rendered inside a Shadow DOM so the extension's styles never clash
   with YouTube's, and vice versa.
+
+> Why three strategies? YouTube has been returning empty bodies for the raw
+> caption URLs unless the request carries an internally-generated token. The
+> `get_transcript` API and DOM-scraping paths sidestep that, so the transcript
+> still loads.
 
 ## Files
 
