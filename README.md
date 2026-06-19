@@ -1,67 +1,76 @@
 # YouTube Transcript Sidebar
 
-A Chrome extension (Manifest V3) that extracts the transcript of any YouTube
-video you're watching and displays it in a clean sidebar — with one-click copy.
+A Manifest V3 Chrome extension that extracts the transcript of the YouTube video
+you're watching and presents it in a polished panel docked to the right of the
+page. When closed, it collapses to an always-present **ribbon** pinned to the
+top-right edge — click it to reopen.
+
+Built to the high-fidelity design handoff: a sleek red / grey / white theme,
+recreated as a real extension (no-build vanilla JS in a Shadow DOM).
 
 ## Features
 
-- **Transcript extraction** for any YouTube video that has captions (manual or
-  auto-generated), in the video's own language (prefers English when available).
-- **Sidebar UI** that slides in from the right, styled to match YouTube's dark
-  theme.
-- **Copy buttons**:
-  - `Copy` — the plain transcript text.
-  - `Copy w/ time` — the transcript with `[mm:ss]` timestamps.
-- **Click-to-seek** — click any timestamp to jump the video to that point.
-- **Search** — filter transcript lines as you type.
-- **SPA-aware** — automatically reloads the transcript when you navigate to a
-  new video without a full page reload.
+- **Docked panel + ever-present ribbon.** 392px panel that slides in from the
+  right; collapses to a top-right ribbon showing the live line count. State
+  persists across reloads and SPA navigation (`chrome.storage.local`).
+- **Robust transcript extraction** with three fallback strategies (see below),
+  so it keeps working even when one path is blocked.
+- **Search** — live, case-insensitive filtering of transcript lines.
+- **Language switch** — pick any available caption track from the dropdown.
+- **Timestamps toggle** — show/hide the timestamp column (persisted).
+- **Click-to-seek** — click any line to jump the video to that moment.
+- **Active-line tracking** — the currently-playing line is highlighted and
+  auto-scrolled into view (toggleable in Settings).
+- **Copy all** — copies the transcript to the clipboard with a toast.
+- **Download** — `.txt` (`mm:ss  text`) or `.srt` (indexed, `HH:MM:SS,mmm`).
+- **Footer status** — line count, total duration, and extraction state
+  (Extracting… / Extracted / No transcript available).
 
 ## Install (Load Unpacked)
 
-1. Open `chrome://extensions` in Chrome (or any Chromium browser).
-2. Enable **Developer mode** (top-right toggle).
+1. Open `chrome://extensions`.
+2. Enable **Developer mode** (top-right).
 3. Click **Load unpacked** and select this folder.
-4. Open any YouTube video and click the extension's toolbar icon to toggle the
-   sidebar.
+4. Open a YouTube video. The ribbon appears top-right; click it (or the toolbar
+   icon) to open the panel.
+
+No build step — the extension loads directly.
 
 ## How it works
 
-- Clicking the toolbar icon (handled in `background.js`) sends a toggle message
-  to the content script.
-- `content.js` loads the transcript using three fallback strategies, in order,
-  stopping at the first that returns text:
-  1. **`get_transcript` API** — the same InnerTube endpoint YouTube's own "Show
-     transcript" button uses. The transcript params and InnerTube context are
-     parsed out of the watch page, then POSTed to
-     `youtubei/v1/get_transcript`.
-  2. **Caption URLs (timedtext)** — parses `captionTracks` from the page and
-     downloads them as `json3`, falling back to XML.
+- The UI is mounted into a **Shadow DOM** so YouTube's CSS can't bleed in (and
+  vice-versa). The shadow host is a click-through, clipped full-viewport layer,
+  so the off-screen panel never adds a scrollbar to YouTube.
+- The toolbar icon (`background.js`) toggles the panel; it injects the content
+  script on demand if needed.
+- `content.js` loads the transcript using three strategies, in order, stopping
+  at the first that returns text:
+  1. **Caption track URLs (timedtext)** — parses `captionTracks` from the watch
+     page and downloads the selected language as `json3` (falling back to XML).
+     This also powers the language dropdown.
+  2. **`get_transcript` API** — the InnerTube endpoint YouTube's own "Show
+     transcript" button uses; immune to the empty-body problem that affects raw
+     caption URLs.
   3. **DOM scraping** — opens YouTube's own transcript panel and reads the
-     rendered segments straight out of the page. Slower and briefly visible,
-     but works even when the network paths are blocked.
-- All requests are same-origin to `www.youtube.com`.
-- The UI is rendered inside a Shadow DOM so the extension's styles never clash
-  with YouTube's, and vice versa.
-
-> Why three strategies? YouTube has been returning empty bodies for the raw
-> caption URLs unless the request carries an internally-generated token. The
-> `get_transcript` API and DOM-scraping paths sidestep that, so the transcript
-> still loads.
+     rendered segments straight out of the page.
+- SPA navigation is handled via `yt-navigate-finish` (plus a URL poll), so the
+  transcript re-extracts when you switch videos without a full reload.
 
 ## Files
 
-| File            | Purpose                                            |
-| --------------- | -------------------------------------------------- |
-| `manifest.json` | Extension manifest (MV3).                          |
-| `background.js` | Service worker — toggles the sidebar on icon click.|
-| `content.js`    | Transcript fetching + sidebar UI logic.            |
-| `sidebar.css`   | Styles for the sidebar (loaded into the Shadow DOM).|
-| `icons/`        | Toolbar / store icons.                             |
+| File            | Purpose                                                    |
+| --------------- | ---------------------------------------------------------- |
+| `manifest.json` | Extension manifest (MV3).                                  |
+| `background.js` | Service worker — toggles the panel on toolbar-icon click.  |
+| `content.js`    | Transcript extraction + the full panel/ribbon UI + logic.  |
+| `sidebar.css`   | Styles (design tokens), loaded into the Shadow DOM.        |
+| `icons/`        | Toolbar / store icons.                                     |
 
 ## Notes & limitations
 
-- Works only on `https://www.youtube.com/*` (regular videos and Shorts).
-- Videos without any captions will show "No transcript is available."
-- YouTube's internal page structure can change over time; if extraction breaks,
-  the parsing logic in `getCaptionTracks` is the place to update.
+- Runs on `https://www.youtube.com/*` (watch pages and Shorts).
+- Summary and Chapters tabs are placeholders (the design marks them as stretch).
+- The panel uses 'Plus Jakarta Sans' (loaded from Google Fonts); if a page CSP
+  blocks the webfont it falls back to the system UI font.
+- If extraction ever breaks, `content.js` logs each strategy under
+  `[Transcript Sidebar]` in the DevTools console.

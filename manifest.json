@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "YouTube Transcript Sidebar",
-  "version": "1.0.0",
-  "description": "Extracts the transcript of any YouTube video you're watching and shows it in a sidebar with copy buttons.",
+  "version": "2.0.0",
+  "description": "Extracts the transcript of any YouTube video into a docked panel with search, language switch, timestamps, copy and .txt/.srt download.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["https://www.youtube.com/*"],
   "action": {
