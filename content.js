@@ -35,25 +35,76 @@
     return null;
   }
 
-  // Pull the caption track list for a video by parsing the watch page HTML.
-  // This avoids needing an InnerTube API key and survives SPA navigation.
-  async function getCaptionTracks(videoId) {
-    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+  // Extract the JSON array that follows `key` from a blob of text, matching
+  // brackets while respecting strings. More reliable than a regex because
+  // caption track objects can themselves contain nested arrays.
+  function extractArrayAfter(text, key) {
+    const keyIdx = text.indexOf(key);
+    if (keyIdx === -1) return null;
+    const start = text.indexOf("[", keyIdx);
+    if (start === -1) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') {
+        inStr = true;
+      } else if (c === "[") {
+        depth++;
+      } else if (c === "]") {
+        depth--;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return null;
+  }
+
+  function parseCaptionTracks(text) {
+    const arr = extractArrayAfter(text, '"captionTracks"');
+    if (!arr) return [];
+    try {
+      return JSON.parse(arr);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // The current page already embeds the player response (with valid, session
+  // scoped caption URLs) in an inline <script>. Reading it avoids an extra
+  // network round-trip and the EU consent interstitial. Only trusted when the
+  // page is actually showing the video we want.
+  function readCaptionTracksFromPage(videoId) {
+    if (getVideoId() !== videoId) return [];
+    for (const script of document.scripts) {
+      const t = script.textContent;
+      if (t && t.includes('"captionTracks"') && t.includes(videoId)) {
+        const tracks = parseCaptionTracks(t);
+        if (tracks.length) return tracks;
+      }
+    }
+    return [];
+  }
+
+  // Fallback: fetch the watch page HTML and parse the caption tracks out of it.
+  async function fetchCaptionTracks(videoId) {
+    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
       credentials: "include",
     });
     if (!res.ok) {
       throw new Error(`Failed to load video page (${res.status})`);
     }
-    const html = await res.text();
-    const match = html.match(/"captionTracks":(\[.*?\])(?=,"audioTracks"|,"translationLanguages"|\})/s);
-    if (!match) {
-      return [];
-    }
-    try {
-      return JSON.parse(match[1]);
-    } catch (_) {
-      return [];
-    }
+    return parseCaptionTracks(await res.text());
+  }
+
+  async function getCaptionTracks(videoId) {
+    const fromPage = readCaptionTracksFromPage(videoId);
+    if (fromPage.length) return fromPage;
+    return fetchCaptionTracks(videoId);
   }
 
   function pickTrack(tracks) {
@@ -69,20 +120,20 @@
     );
   }
 
-  async function fetchSegments(track) {
-    const url = track.baseURL + "&fmt=json3";
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) {
-      throw new Error(`Failed to load captions (${res.status})`);
-    }
-    const data = await res.json();
+  function decodeEntities(str) {
+    const ta = document.createElement("textarea");
+    ta.innerHTML = str;
+    return ta.value;
+  }
+
+  function parseJson3(data) {
     const out = [];
     for (const event of data.events || []) {
       if (!event.segs) continue;
       const text = event.segs
         .map((s) => s.utf8 || "")
         .join("")
-        .replace(/\n/g, " ")
+        .replace(/\s+/g, " ")
         .trim();
       if (!text) continue;
       out.push({
@@ -92,6 +143,53 @@
       });
     }
     return out;
+  }
+
+  function parseXmlCaptions(xml) {
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+    const out = [];
+    doc.querySelectorAll("text").forEach((node) => {
+      const text = decodeEntities(node.textContent || "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text) return;
+      out.push({
+        start: parseFloat(node.getAttribute("start") || "0"),
+        dur: parseFloat(node.getAttribute("dur") || "0"),
+        text,
+      });
+    });
+    return out;
+  }
+
+  async function fetchCaptionBody(url) {
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`captions HTTP ${res.status}`);
+    return (await res.text()).trim();
+  }
+
+  // YouTube intermittently returns an empty body for a given caption format,
+  // so try json3 first and fall back to the default XML format.
+  async function fetchSegments(track) {
+    const base = track.baseURL;
+
+    try {
+      const body = await fetchCaptionBody(base + "&fmt=json3");
+      if (body) {
+        const segs = parseJson3(JSON.parse(body));
+        if (segs.length) return segs;
+      }
+    } catch (err) {
+      console.debug("YouTube Transcript Sidebar: json3 failed", err);
+    }
+
+    const xml = await fetchCaptionBody(base);
+    if (xml) {
+      const segs = parseXmlCaptions(xml);
+      if (segs.length) return segs;
+    }
+
+    throw new Error("captions returned no usable text");
   }
 
   async function loadTranscript(videoId) {
